@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import SEED_ROWS, SEED_ROUTE_GRANTS
 
 
 class Store:
@@ -15,6 +15,16 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        self._seed_route_grants()
+
+    def _seed_route_grants(self) -> None:
+        """把示例授权灌进管道总线，起服务后即可直接核对表归属。"""
+        from app.pipeline import pipeline_bus
+        for row in SEED_ROUTE_GRANTS:
+            pipeline_bus.register_route_grant(
+                row["target_id"], row["database"], row["table"],
+                grant_id=row["grant_id"], channels=row["channels"],
+            )
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

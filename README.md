@@ -77,5 +77,34 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 路由目标授权与批量回放
+
+路由分发不只看「主目标还是备用目标」，还要按接收方权限核对表归属：
+
+- 授权记录粒度为 `接收方目标 + 库 + 表`，登记/撤回互不影响其他表；
+  种子数据里主备两个目标各持有 `finance.orders`、`sales.orders` 两条资格。
+- 事件过滤的放行结果交给路由：路由逐目标核对授权，生成「可投递目标数据」；
+  分发入口实际使用该目标集合，并把未获授权或主端不可用的来源行回写为拒绝行。
+- 主目标超时只让它本轮不接收；已撤权的备用表（如 `finance.orders`）不能从备用端送出，
+  同批次其他库表（如 `sales.orders`）仍独立可投递。
+- 备用发送前会再核对一次库表权限，路由核对之后才撤的权同样拦得住。
+- 每条实际送达都落投递回执；已送达的源行保留原回执与原授权，
+  再次回放只按回执跳过，不会重复交付同一行。
+- `GET /api/route_dispatcher/replays/{replay_id}` 按表汇总「实际抵达目标 / 被拒目标 / 回执跳过」，
+  说明整轮回放与单表资格冲突时哪部分数据真正抵达。
+
+相关接口（均挂在 `route_dispatcher` 模块下）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET/POST | `/api/route_dispatcher/route-grants` | 查询/登记表归属授权 |
+| POST | `/api/route_dispatcher/route-grants/revoke` | 撤回某目标某张表的资格 |
+| GET | `/api/route_dispatcher/delivery` | 可投递目标数据、拒绝行、回执 |
+| POST | `/api/route_dispatcher/replay` | 发起批量回放 |
+| GET | `/api/route_dispatcher/replays/{replay_id}` | 回放报告 |
+
+前端在「路由分发」页下方提供授权清单、撤回按钮和回放表单。
+后端行为用例：`cd backend && .venv/bin/python -I tests/test_route_delivery.py`。
+
 领域：数据工程
 子方向：数仓与数据湖

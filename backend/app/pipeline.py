@@ -65,6 +65,42 @@ class CheckpointRecord:
     data_checksum: str
 
 
+@dataclass
+class RouteTargetGrant:
+    """路由目标授权记录：某个下游目标对一组库表的投递资格。
+
+    一条授权只覆盖单张表 (target_id + database + table)，
+    因此同一目标可以只对部分表保持资格，其余表独立失效。
+    """
+    grant_id: str
+    target_id: str
+    database: str
+    table: str
+    enabled: bool = True
+    revoked_at: datetime | None = None
+    reason: str = ""
+    # 该授权覆盖的通道，空表示目标本身即可投递
+    channels: list[str] = field(default_factory=list)
+
+    @property
+    def qualified_table(self) -> str:
+        return f"{self.database}.{self.table}"
+
+
+@dataclass
+class DeliveryReceipt:
+    """投递回执：记录源行实际抵达的目标，重发时凭回执跳过已交付行。"""
+    receipt_key: str
+    event_id: str
+    source_db: str
+    source_table: str
+    target_id: str
+    grant_id: str
+    delivered_at: datetime
+    payload_digest: str
+    replayed: bool = False
+
+
 class PipelineBus:
     """管道级事件总线：持有事件队列、Schema 注册表、位点注册表、SCD 状态存储。
 
@@ -90,6 +126,16 @@ class PipelineBus:
         self.dedup_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # 路由规则 — route_dispatcher 核心配置
         self.routing_table: list[dict[str, Any]] = []
+        # 路由目标授权 — 按 (目标, 库, 表) 粒度保存投递资格
+        self.route_grants: dict[str, RouteTargetGrant] = {}
+        # 投递回执 — 已确认送达的源行凭回执去重
+        self.delivery_receipts: dict[str, DeliveryReceipt] = {}
+        # 可投递目标数据 — 路由按记录资格生成的待投递结果
+        self.deliverable_target_data: list[dict[str, Any]] = []
+        # 被拒绝的来源行 — 过滤/路由/授权校验不通过时回写
+        self.rejected_rows: list[dict[str, Any]] = []
+        # 回放运行 — key 为 replay_id，保存批次成员、已送达与待回放状态
+        self.replay_runs: dict[str, dict[str, Any]] = {}
         # 过滤规则 — event_filter 核心配置
         self.filter_rules: list[dict[str, Any]] = []
         # 快照比对结果
@@ -205,7 +251,7 @@ class PipelineBus:
         passed = True
         matched: list[str] = []
         for rule in self.filter_rules:
-            if rule.get("status") != "已启用":
+            if rule.get("status") != "已启用" and not rule.get("enabled"):
                 continue
             match = self._match_rule(event, rule)
             if match:
@@ -217,6 +263,209 @@ class PipelineBus:
         if not passed:
             self.pipeline_metrics["filtered"] += 1
         return passed, matched
+
+    # ------------------------------------------------------------------
+    # 路由目标授权：按接收方权限核对表归属
+    # ------------------------------------------------------------------
+    def register_route_grant(
+        self,
+        target_id: str,
+        database: str,
+        table: str,
+        *,
+        grant_id: str = "",
+        enabled: bool = True,
+        channels: list[str] | None = None,
+        reason: str = "",
+    ) -> RouteTargetGrant:
+        """登记一条目标授权记录，归属粒度为 目标 + 库 + 表。"""
+        gid = grant_id or f"grant:{target_id}:{database}.{table}"
+        grant = RouteTargetGrant(
+            grant_id=gid,
+            target_id=target_id,
+            database=database,
+            table=table,
+            enabled=enabled,
+            revoked_at=None if enabled else datetime.now(),
+            reason=reason,
+            channels=list(channels or []),
+        )
+        self.route_grants[gid] = grant
+        return grant
+
+    def find_route_grant(self, target_id: str, database: str, table: str) -> RouteTargetGrant | None:
+        """按接收方、库、表三要素查找仍在生效的授权记录。"""
+        for grant in self.route_grants.values():
+            if (
+                grant.target_id == target_id
+                and grant.database == database
+                and grant.table == table
+                and grant.enabled
+            ):
+                return grant
+        return None
+
+    def revoke_route_grant(self, target_id: str, database: str, table: str,
+                           reason: str = "") -> list[str]:
+        """撤回某目标对指定表的投递资格，返回被撤回的授权ID列表。
+
+        只撤回匹配该库表的授权，同目标下其他表的资格保持独立。
+        """
+        revoked: list[str] = []
+        for grant in self.route_grants.values():
+            if (
+                grant.target_id == target_id
+                and grant.database == database
+                and grant.table == table
+                and grant.enabled
+            ):
+                grant.enabled = False
+                grant.revoked_at = datetime.now()
+                grant.reason = reason or grant.reason
+                revoked.append(grant.grant_id)
+        return revoked
+
+    def verify_delivery_authorization(
+        self, target_id: str, database: str, table: str
+    ) -> tuple[bool, RouteTargetGrant | None, str]:
+        """发送前重新核对库表权限：返回 (是否可发, 授权, 拒绝原因)。"""
+        grant = self.find_route_grant(target_id, database, table)
+        if grant is not None:
+            return True, grant, ""
+        known = [
+            g for g in self.route_grants.values()
+            if g.target_id == target_id and g.database == database and g.table == table
+        ]
+        if known:
+            return False, known[-1], f"{target_id} 对 {database}.{table} 的授权已撤回"
+        return False, None, f"{target_id} 未登记 {database}.{table} 的表归属授权"
+
+    def compute_receipt_key(self, event_id: str, target_id: str) -> str:
+        """回执键：同一源行投递到同一目标只应有一条回执。"""
+        return f"{target_id}::{event_id}"
+
+    def find_delivery_receipt(self, event_id: str, target_id: str) -> DeliveryReceipt | None:
+        """查询源行是否已有该目标的送达回执。"""
+        return self.delivery_receipts.get(self.compute_receipt_key(event_id, target_id))
+
+    def build_deliverable_targets(
+        self,
+        event: ChangeEventRecord,
+        targets: list[str],
+        *,
+        replay_id: str = "",
+    ) -> dict[str, Any]:
+        """按目标授权把一次放行结果展开成可投递目标数据。
+
+        每个目标单独核对表归属：某个目标失去某张表的资格，
+        不影响其他目标或其他表；已送达且持有回执的行不会再次生成可投递项。
+        """
+        deliverable: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        already_delivered: list[dict[str, Any]] = []
+        seen_targets: set[str] = set()
+        for target_id in targets:
+            if target_id in seen_targets:
+                continue
+            seen_targets.add(target_id)
+            # 先看回执：已经送达的行保留原回执与原授权，
+            # 即使之后表归属被撤权也不改判为「未授权」，只按回执跳过重发。
+            receipt = self.find_delivery_receipt(event.event_id, target_id)
+            if receipt is not None:
+                already_delivered.append({
+                    "event_id": event.event_id,
+                    "target_id": target_id,
+                    "receipt_key": receipt.receipt_key,
+                    "receipt": self._receipt_view(receipt),
+                })
+                continue
+            ok, grant, reason = self.verify_delivery_authorization(
+                target_id, event.source_db, event.source_table
+            )
+            if not ok:
+                rejected.append({
+                    "event_id": event.event_id,
+                    "source_db": event.source_db,
+                    "source_table": event.source_table,
+                    "target_id": target_id,
+                    "grant_id": grant.grant_id if grant else "",
+                    "reason": reason,
+                    "stage": "route_authorization",
+                    "replay_id": replay_id,
+                    "recorded_at": datetime.now().isoformat(),
+                })
+                continue
+            deliverable.append({
+                "event_id": event.event_id,
+                "source_db": event.source_db,
+                "source_table": event.source_table,
+                "source_row": f"{event.source_db}.{event.source_table}",
+                "operation": event.operation,
+                "target_id": target_id,
+                "grant_id": grant.grant_id,
+                "qualified_table": grant.qualified_table,
+                "binlog_file": event.binlog_file,
+                "binlog_pos": event.binlog_pos,
+                "gtid": event.gtid,
+                "replay_id": replay_id,
+                "payload_digest": self.compute_event_hash(event),
+                "status": "待投递",
+            })
+        return {
+            "event_id": event.event_id,
+            "deliverable": deliverable,
+            "rejected": rejected,
+            "already_delivered": already_delivered,
+        }
+
+    def commit_delivery(
+        self, item: dict[str, Any], *, replayed: bool = False
+    ) -> DeliveryReceipt:
+        """记录一条可投递目标数据已实际交付，并固化原回执与授权。"""
+        key = self.compute_receipt_key(item["event_id"], item["target_id"])
+        existing = self.delivery_receipts.get(key)
+        if existing is not None:
+            # 已有回执时不改写送达时间和授权，重发不会重复交付同一行
+            existing.replayed = existing.replayed or replayed
+            return existing
+        receipt = DeliveryReceipt(
+            receipt_key=key,
+            event_id=item["event_id"],
+            source_db=item["source_db"],
+            source_table=item["source_table"],
+            target_id=item["target_id"],
+            grant_id=item["grant_id"],
+            delivered_at=datetime.now(),
+            payload_digest=item.get("payload_digest", ""),
+            replayed=replayed,
+        )
+        self.delivery_receipts[key] = receipt
+        for entry in self.deliverable_target_data:
+            if (
+                entry["event_id"] == item["event_id"]
+                and entry["target_id"] == item["target_id"]
+            ):
+                entry["status"] = "已送达"
+                entry["receipt_key"] = key
+        return receipt
+
+    def _receipt_view(self, receipt: DeliveryReceipt) -> dict[str, Any]:
+        """回执的可序列化视图，保留原授权信息。"""
+        grant = self.route_grants.get(receipt.grant_id)
+        return {
+            "receipt_key": receipt.receipt_key,
+            "event_id": receipt.event_id,
+            "source_db": receipt.source_db,
+            "source_table": receipt.source_table,
+            "target_id": receipt.target_id,
+            "grant_id": receipt.grant_id,
+            "grant_qualified_table": grant.qualified_table if grant else
+            f"{receipt.source_db}.{receipt.source_table}",
+            "grant_revoked": bool(grant and not grant.enabled),
+            "delivered_at": receipt.delivered_at.isoformat(),
+            "payload_digest": receipt.payload_digest,
+            "replayed": receipt.replayed,
+        }
 
     def evaluate_route(self, event: ChangeEventRecord) -> list[str]:
         """评估路由规则，返回目标通道列表。"""
@@ -328,6 +577,12 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "route_grant_count": len(self.route_grants),
+            "active_route_grant_count": sum(1 for g in self.route_grants.values() if g.enabled),
+            "delivery_receipt_count": len(self.delivery_receipts),
+            "deliverable_target_count": len(self.deliverable_target_data),
+            "rejected_row_count": len(self.rejected_rows),
+            "replay_run_count": len(self.replay_runs),
         }
 
 

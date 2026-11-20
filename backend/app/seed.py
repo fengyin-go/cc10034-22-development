@@ -599,3 +599,37 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '心跳超时': '故障切换样例3',
   '上次切换时间': '2026-09-03'}]
 }
+
+
+# 路由目标授权样例：主/备两个下游对两个库的同名表各自持有独立资格。
+# 撤掉其中一条只影响该目标的那张表，其他表仍然可投递。
+SEED_ROUTE_GRANTS: list[dict[str, Any]] = [
+    {
+        "grant_id": "grant:primary_sink:finance.orders",
+        "target_id": "primary_sink",
+        "database": "finance",
+        "table": "orders",
+        "channels": ["cdc-primary"],
+    },
+    {
+        "grant_id": "grant:primary_sink:sales.orders",
+        "target_id": "primary_sink",
+        "database": "sales",
+        "table": "orders",
+        "channels": ["cdc-primary"],
+    },
+    {
+        "grant_id": "grant:standby_sink:finance.orders",
+        "target_id": "standby_sink",
+        "database": "finance",
+        "table": "orders",
+        "channels": ["cdc-standby"],
+    },
+    {
+        "grant_id": "grant:standby_sink:sales.orders",
+        "target_id": "standby_sink",
+        "database": "sales",
+        "table": "orders",
+        "channels": ["cdc-standby"],
+    },
+]
